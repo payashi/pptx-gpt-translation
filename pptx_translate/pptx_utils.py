@@ -1,8 +1,11 @@
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.oxml.ns import qn
+from pptx.oxml.xmlchemy import OxmlElement
 from pptx.table import Table
 
 
@@ -103,6 +106,35 @@ def set_text(tf, new_text: str):
     # Preserve existing formatting by reusing current paragraphs and runs.
     new_text = "" if new_text is None else new_text
     paragraphs = list(tf.paragraphs)
+
+    # Remove field elements (e.g., date/slide-number placeholders) to avoid duplicate text when rewriting.
+    fld_tags = {qn("a:fld"), qn("a:fldSimple")}
+    for para in paragraphs:
+        parent = para._p
+        children = list(parent)
+        for idx, child in enumerate(children):
+            if child.tag not in fld_tags:
+                continue
+            replacements = []
+            if child.tag == qn("a:fldSimple"):
+                replacements = [deepcopy(run) for run in child.findall(qn("a:r"))]
+            else:  # a:fld
+                # Some fields embed runs; reuse them if present.
+                embedded_runs = child.findall(qn("a:r"))
+                if embedded_runs:
+                    replacements = [deepcopy(run) for run in embedded_runs]
+                else:
+                    text_el = child.find(qn("a:t"))
+                    if text_el is not None:
+                        new_run = OxmlElement("a:r")
+                        rpr = child.find(qn("a:rPr"))
+                        if rpr is not None:
+                            new_run.append(deepcopy(rpr))
+                        new_run.append(deepcopy(text_el))
+                        replacements = [new_run]
+            parent.remove(child)
+            for offset, repl in enumerate(replacements):
+                parent.insert(idx + offset, repl)
 
     # If there is no formatting to preserve, fall back to direct assignment.
     if not paragraphs:
