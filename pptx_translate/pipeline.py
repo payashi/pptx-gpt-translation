@@ -71,7 +71,6 @@ def translate_presentation(
             by_slide.setdefault(sidx, []).append(it)
 
         deck_summary = summarize_deck(slide_titles)
-        progress = tqdm(total=len(items), desc="Translating")
 
         def make_context(current_idx: Optional[int]) -> str:
             if strategy == "title-only":
@@ -99,6 +98,16 @@ def translate_presentation(
                 return False
             return group_slide_idx in selected_slides
 
+        if selected_slides is None:
+            total_progress = len(items)
+        else:
+            total_progress = sum(
+                len(group)
+                for sidx, group in by_slide.items()
+                if should_translate_group(sidx)
+            )
+        progress = tqdm(total=total_progress, desc="Translating")
+
         any_translated = False
 
         for sidx, group in by_slide.items():
@@ -114,7 +123,6 @@ def translate_presentation(
                 if log_fh:
                     log_fh.write(f"Context:\n{context}\n")
                     log_fh.write("Skipped due to --slides filter.\n\n")
-                progress.update(len(group))
                 continue
 
             non_empty_idxs = [i for i, t in enumerate(texts) if t.strip()]
