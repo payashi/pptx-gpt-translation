@@ -48,7 +48,7 @@ class ResponsesGPTTranslator(BaseTranslator):
             raise RuntimeError(
                 "The installed `openai` package does not expose structured output parameters for the Responses API. "
                 "Install a release that supports either the `response_format` or `text.format` JSON schema configuration "
-                "(for example `pip install \"openai>=1.48,<2.0\"`)."
+                '(for example `pip install "openai>=1.48,<2.0"`).'
                 + (f" Detected version: {version}." if version else "")
             )
 
@@ -74,14 +74,16 @@ class ResponsesGPTTranslator(BaseTranslator):
         if not texts:
             return []
 
-        payload = json.dumps({"segments": texts})
+        payload = json.dumps({"segments": texts}, ensure_ascii=False)
 
         sys = (
             "You are a professional translator. "
             f"Translate from {self.source or 'the source language'} to {self.target}. "
             "Preserve technical terms, numbers, math, and code blocks. "
             "Keep bullet-like brevity for short lines; keep paragraph flow for long text. "
-            "While faithfully retaining every keyword from the source (device names, terminology, etc.), craft the translation so it stays natural and slide-ready: concise and preferably ending in nouns. "
+            "While faithfully retaining every keyword from the source (device names, terminology, etc.), craft the translation so it stays natural and slide-ready: concise, nominal in tone, and ending in nouns even if it requires light rephrasing. "
+            "Adjust sentence structure so each translation reads as natural slide text in the target language, keeping it concise, polished, and ending in noun phrasing rather than a literal English rendering. "
+            'For example, rephrase "Cooling requirements for the FTQC device can be met with commercially available cryoplants" as the noun phrase "Fulfillment of FTQC device cooling requirements via commercially available cryoplants". '
             "Leave English personal names exactly as written in English; do not translate or transliterate them. "
             "If a line is a source attribution, copy it verbatim without translating. "
             "Return the final answer strictly as JSON with a single field `translations`, which is an array of strings whose length matches the number of provided segments."
@@ -143,7 +145,9 @@ class ResponsesGPTTranslator(BaseTranslator):
                 }
             }
         else:
-            raise RuntimeError("Structured output not supported by the current OpenAI client.")
+            raise RuntimeError(
+                "Structured output not supported by the current OpenAI client."
+            )
 
         if self.temperature is not None:
             request_args["temperature"] = self.temperature
