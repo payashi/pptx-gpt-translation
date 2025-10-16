@@ -77,8 +77,15 @@ def iter_text_frames(shapes):
     # Yield text_frame objects from shapes (including groups, tables, and some charts)
     for shape in shapes:
         # Charts (where available)
-        if hasattr(shape, "chart"):
+        chart = None
+        try:
             chart = shape.chart
+        except (AttributeError, ValueError, KeyError):
+            chart = None
+        except Exception:
+            chart = None
+
+        if chart is not None:
             try:
                 if (
                     chart.has_title
