@@ -17,7 +17,7 @@ Example:
 import os
 import csv
 import argparse
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 from dataclasses import dataclass
 
 from tenacity import (
@@ -71,6 +71,39 @@ def apply_glossary(text: str, glossary: List[Tuple[str, str]]) -> str:
         if src:
             text = text.replace(src, tgt)
     return text
+
+
+def parse_slide_spec(spec: Optional[str], total_slides: int) -> Tuple[Optional[Set[int]], bool]:
+    if not spec:
+        return None, False
+    selected: Set[int] = set()
+    invalid = False
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    for part in parts:
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            if not start_str.strip().isdigit() or not end_str.strip().isdigit():
+                invalid = True
+                continue
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                start, end = end, start
+            for num in range(start, end + 1):
+                if 1 <= num <= total_slides:
+                    selected.add(num - 1)
+                else:
+                    invalid = True
+        else:
+            if not part.isdigit():
+                invalid = True
+                continue
+            num = int(part)
+            if 1 <= num <= total_slides:
+                selected.add(num - 1)
+            else:
+                invalid = True
+    return selected, invalid
 
 
 def iter_text_frames(shapes):
@@ -278,6 +311,8 @@ class GPTTranslator:
             f"Translate from {self.source or 'the source language'} to {self.target}. "
             "Preserve technical terms, numbers, math, and code blocks. "
             "Keep bullet-like brevity for short lines; keep paragraph flow for long text. "
+            "While faithfully retaining every keyword from the source (device names, terminology, etc.), craft the translation so it stays natural and slide-ready: concise and preferably ending in nouns. "
+            "If a line is a source attribution, copy it verbatim without translating. "
             "Do NOT add extra commentary. Return only the translations joined by the same delimiter."
         )
 
@@ -341,12 +376,23 @@ def main():
     ap.add_argument(
         "--dry_run", action="store_true", help="Preview changes without saving"
     )
+    ap.add_argument("--log", default=None, help="File path to write translation log")
+    ap.add_argument(
+        "--slides",
+        default=None,
+        help="Comma-separated slide numbers or ranges to translate (e.g., 1,3-5)",
+    )
     args = ap.parse_args()
 
     prs = Presentation(args.input)
     items, slide_titles = collect_items(
         prs, include_notes=args.notes, include_masters=args.masters
     )
+    selected_slides, slides_invalid = parse_slide_spec(args.slides, len(prs.slides))
+    if slides_invalid:
+        print("[WARN] Some slide identifiers in --slides were invalid or out of range and have been ignored.")
+    if args.slides and selected_slides is not None and not selected_slides:
+        print("[WARN] No valid slide numbers specified in --slides; nothing will be translated.")
 
     # Map slide index by owner string
     slide_indices = []
@@ -368,144 +414,179 @@ def main():
         temperature=args.temperature,
     )
 
-    # Group items by slide index for batching (masters/layouts may be None; we still batch them separately)
-    by_slide: Dict[Optional[int], List[TextItem]] = {}
-    for it, sidx in zip(items, slide_indices):
-        by_slide.setdefault(sidx, []).append(it)
+    log_fh = None
+    if args.log:
+        log_fh = open(args.log, "w", encoding="utf-8")
 
-    # Build deck summary once
-    deck_summary = summarize_deck(slide_titles)
+    try:
+        # Group items by slide index for batching (masters/layouts may be None; we still batch them separately)
+        by_slide: Dict[Optional[int], List[TextItem]] = {}
+        for it, sidx in zip(items, slide_indices):
+            by_slide.setdefault(sidx, []).append(it)
 
-    # Translate per group
-    out_texts: Dict[int, str] = {}
-    progress = tqdm(total=len(items), desc="Translating")
+        # Build deck summary once
+        deck_summary = summarize_deck(slide_titles)
 
-    # Helper to make context per slide
-    def make_context(current_idx: Optional[int]) -> str:
-        if args.strategy == "title-only":
-            title = (
-                slide_titles[current_idx]
-                if (current_idx is not None and 0 <= current_idx < len(slide_titles))
-                else ""
-            )
-            return f"Deck title(s): {slide_titles[0] if slide_titles else ''}. Current slide title: {title}."
-        elif args.strategy == "deck":
-            return deck_summary
-        else:  # neighbor
-            if current_idx is None:
+        # Translate per group
+        progress = tqdm(total=len(items), desc="Translating")
+
+        # Helper to make context per slide
+        def make_context(current_idx: Optional[int]) -> str:
+            if args.strategy == "title-only":
+                title = (
+                    slide_titles[current_idx]
+                    if (current_idx is not None and 0 <= current_idx < len(slide_titles))
+                    else ""
+                )
+                return f"Deck title(s): {slide_titles[0] if slide_titles else ''}. Current slide title: {title}."
+            elif args.strategy == "deck":
                 return deck_summary
-            titles = []
-            for j in [current_idx - 1, current_idx, current_idx + 1]:
-                if 0 <= j < len(slide_titles):
-                    titles.append(f"Slide {j+1}: {slide_titles[j]}")
-            return "Neighbor titles:\n" + "\n".join(titles)
+            else:  # neighbor
+                if current_idx is None:
+                    return deck_summary
+                titles = []
+                for j in [current_idx - 1, current_idx, current_idx + 1]:
+                    if 0 <= j < len(slide_titles):
+                        titles.append(f"Slide {j+1}: {slide_titles[j]}")
+                return "Neighbor titles:\n" + "\n".join(titles)
 
-    # Perform translation
-    for sidx, group in by_slide.items():
-        texts = [it.text for it in group]
-        # Skip empty batch quickly
-        non_empty_idxs = [i for i, t in enumerate(texts) if t.strip()]
-        if not non_empty_idxs:
+        def should_translate_group(group_slide_idx: Optional[int]) -> bool:
+            if selected_slides is None:
+                return True
+            if group_slide_idx is None:
+                return False
+            return group_slide_idx in selected_slides
+
+        # Perform translation
+        for sidx, group in by_slide.items():
+            texts = [it.text for it in group]
+            original_texts = list(texts)
+            context = make_context(sidx)
+            if not should_translate_group(sidx):
+                if log_fh:
+                    log_fh.write(f"## Group owner: {group[0].owner if group else 'unknown'}\n")
+                    log_fh.write(f"Context:\n{context}\n")
+                    log_fh.write("Skipped due to --slides filter.\n\n")
+                progress.update(len(group))
+                continue
+            # Skip empty batch quickly
+            non_empty_idxs = [i for i, t in enumerate(texts) if t.strip()]
+            if not non_empty_idxs:
+                if log_fh:
+                    log_fh.write(f"## Group owner: {group[0].owner if group else 'unknown'}\n")
+                    log_fh.write(f"Context:\n{context}\n")
+                    log_fh.write("All items blank; skipped translation.\n\n")
+                progress.update(len(group))
+                continue
+            to_send = [texts[i] for i in non_empty_idxs]
+            translated = translator.translate(to_send, context=context)
+            # Place back
+            j = 0
+            for i in range(len(texts)):
+                if i in non_empty_idxs:
+                    new_t = translated[j]
+                    if glossary:
+                        new_t = apply_glossary(new_t, glossary)
+                    texts[i] = new_t
+                    j += 1
+            if log_fh:
+                log_fh.write(f"## Group owner: {group[0].owner if group else 'unknown'}\n")
+                log_fh.write(f"Context:\n{context}\n")
+                for item, src_text, dst_text in zip(group, original_texts, texts):
+                    log_fh.write(f"- {item.owner} (#{item.idx})\n")
+                    log_fh.write("SRC:\n")
+                    log_fh.write((src_text or "") + "\n")
+                    log_fh.write("DST:\n")
+                    log_fh.write((dst_text or "") + "\n\n")
+            # Write back or preview
+            if args.dry_run:
+                for item, new_t in zip(group, texts):
+                    if new_t != item.text:
+                        print(f"[DRY-RUN] {item.owner} (#{item.idx}):")
+                        src = item.text
+                        dst = new_t
+
+                        def trunc(s):
+                            return (s[:120] + "...") if len(s) > 120 else s
+
+                        print("  SRC:", repr(trunc(src)))
+                        print("  DST:", repr(trunc(dst)))
+            else:
+                # Re-apply into the actual text frames
+                # We need to find the shape again; simplest approach: iterate again in the same order
+                # We'll re-collect frames and set in a second pass to keep the mapping stable.
+                pass  # defer to a final application loop after translation
+            # Store final texts back into items array for later application
+            for k, item in enumerate(group):
+                items[item.idx] = TextItem(owner=item.owner, idx=item.idx, text=texts[k])
+
             progress.update(len(group))
-            continue
-        to_send = [texts[i] for i in non_empty_idxs]
-        context = make_context(sidx)
-        translated = translator.translate(to_send, context=context)
-        # Place back
-        j = 0
-        for i in range(len(texts)):
-            if i in non_empty_idxs:
-                new_t = translated[j]
-                if glossary:
-                    new_t = apply_glossary(new_t, glossary)
-                texts[i] = new_t
-                j += 1
-        # Write back or preview
+
+        progress.close()
+
         if args.dry_run:
-            for item, new_t in zip(group, texts):
-                if new_t != item.text:
-                    print(f"[DRY-RUN] {item.owner} (#{item.idx}):")
-                    src = item.text
-                    dst = new_t
+            print("Dry-run complete. No file written.")
+            return
 
-                    def trunc(s):
-                        return (s[:120] + "...") if len(s) > 120 else s
-
-                    print("  SRC:", repr(trunc(src)))
-                    print("  DST:", repr(trunc(dst)))
-        else:
-            # Re-apply into the actual text frames
-            # We need to find the shape again; simplest approach: iterate again in the same order
-            # We'll re-collect frames and set in a second pass to keep the mapping stable.
-            pass  # defer to a final application loop after translation
-        # Store final texts back into items array for later application
-        for k, item in enumerate(group):
-            items[item.idx] = TextItem(owner=item.owner, idx=item.idx, text=texts[k])
-
-        progress.update(len(group))
-
-    progress.close()
-
-    if args.dry_run:
-        print("Dry-run complete. No file written.")
-        return
-
-    # Final pass: re-open and write translated strings in the same discovery order
-    prs2 = Presentation(args.input)
-    new_items, _ = collect_items(
-        prs2, include_notes=args.notes, include_masters=args.masters
-    )
-    if len(new_items) != len(items):
-        print(
-            "[WARN] Item count changed between passes; attempting best-effort application."
+        # Final pass: re-open and write translated strings in the same discovery order
+        prs2 = Presentation(args.input)
+        new_items, _ = collect_items(
+            prs2, include_notes=args.notes, include_masters=args.masters
         )
-    apply_count = 0
-    for old, (owner, new) in zip(items, [(ni.owner, ni.text) for ni in items]):
-        # We must step through new_items in the same sequence and set text
-        # We rely on the order of traversal being stable for the same file.
-        pass
+        if len(new_items) != len(items):
+            print(
+                "[WARN] Item count changed between passes; attempting best-effort application."
+            )
+        apply_count = 0
+        for old, (owner, new) in zip(items, [(ni.owner, ni.text) for ni in items]):
+            # We must step through new_items in the same sequence and set text
+            # We rely on the order of traversal being stable for the same file.
+            pass
 
-    # Since we can't directly store references to text_frames across instances,
-    # repeat traversal and set in place:
-    idx = 0
-    for sidx, slide in enumerate(prs2.slides):
-        # slide shapes
-        for tf in iter_text_frames(slide.shapes):
-            if idx < len(items) and items[idx].owner.startswith("slide["):
-                set_text(tf, items[idx].text)
-                idx += 1
-        # notes
-        if args.notes and slide.has_notes_slide:
-            try:
-                ntf = slide.notes_slide.notes_text_frame
-                if ntf:
-                    if idx < len(items) and items[idx].owner.startswith(
-                        f"slide[{sidx+1}]-notes"
-                    ):
-                        set_text(ntf, items[idx].text)
-                        idx += 1
-            except Exception:
-                pass
-
-    # Masters/layouts
-    if args.masters:
-        for m_idx, master in enumerate(prs2.slide_masters):
-            for tf in iter_text_frames(master.shapes):
-                if idx < len(items) and items[idx].owner.startswith(
-                    f"master[{m_idx+1}]"
-                ):
+        # Since we can't directly store references to text_frames across instances,
+        # repeat traversal and set in place:
+        idx = 0
+        for sidx, slide in enumerate(prs2.slides):
+            # slide shapes
+            for tf in iter_text_frames(slide.shapes):
+                if idx < len(items) and items[idx].owner.startswith("slide["):
                     set_text(tf, items[idx].text)
                     idx += 1
-            for l_idx, layout in enumerate(master.slide_layouts):
-                for tf in iter_text_frames(layout.shapes):
+            # notes
+            if args.notes and slide.has_notes_slide:
+                try:
+                    ntf = slide.notes_slide.notes_text_frame
+                    if ntf:
+                        if idx < len(items) and items[idx].owner.startswith(
+                            f"slide[{sidx+1}]-notes"
+                        ):
+                            set_text(ntf, items[idx].text)
+                            idx += 1
+                except Exception:
+                    pass
+
+        # Masters/layouts
+        if args.masters:
+            for m_idx, master in enumerate(prs2.slide_masters):
+                for tf in iter_text_frames(master.shapes):
                     if idx < len(items) and items[idx].owner.startswith(
-                        f"layout[{m_idx+1}.{l_idx+1}]"
+                        f"master[{m_idx+1}]"
                     ):
                         set_text(tf, items[idx].text)
                         idx += 1
+                for l_idx, layout in enumerate(master.slide_layouts):
+                    for tf in iter_text_frames(layout.shapes):
+                        if idx < len(items) and items[idx].owner.startswith(
+                            f"layout[{m_idx+1}.{l_idx+1}]"
+                        ):
+                            set_text(tf, items[idx].text)
+                            idx += 1
 
-    prs2.save(args.output)
-    print(f"Saved translated presentation to: {args.output}")
+        prs2.save(args.output)
+        print(f"Saved translated presentation to: {args.output}")
+    finally:
+        if log_fh:
+            log_fh.close()
 
 
 if __name__ == "__main__":
