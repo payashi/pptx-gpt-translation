@@ -1,4 +1,5 @@
 .venv
 *.pptx
+*.log
 .env*
 !.env.example

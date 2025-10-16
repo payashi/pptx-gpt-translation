@@ -276,7 +276,11 @@ def summarize_deck(slide_titles: List[str], max_slides: int = 4) -> str:
 
 class GPTTranslator:
     def __init__(
-        self, model: str, source: Optional[str], target: str, temperature: float = 0.0
+        self,
+        model: str,
+        source: Optional[str],
+        target: str,
+        temperature: Optional[float] = None,
     ):
         if OpenAI is None:
             raise RuntimeError("OpenAI SDK not available. Install `openai` >= 1.37.0.")
@@ -319,14 +323,17 @@ class GPTTranslator:
         if context:
             sys += f" Use this context for disambiguation: {context[:4000]}"
 
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            temperature=self.temperature,
-            messages=[
+        request_args = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": sys},
                 {"role": "user", "content": joined},
             ],
-        )
+        }
+        if self.temperature is not None:
+            request_args["temperature"] = self.temperature
+
+        resp = self.client.chat.completions.create(**request_args)
         out = resp.choices[0].message.content or ""
         parts = out.split(delimiter)
         # If counts mismatch, fall back to naive split by lines (rare)
@@ -371,7 +378,10 @@ def main():
         help="Context strategy",
     )
     ap.add_argument(
-        "--temperature", type=float, default=0.0, help="Sampling temperature"
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature (omit to use the model's default)",
     )
     ap.add_argument(
         "--dry_run", action="store_true", help="Preview changes without saving"
