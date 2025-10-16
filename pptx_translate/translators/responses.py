@@ -81,7 +81,6 @@ class ResponsesGPTTranslator(BaseTranslator):
             f"Translate from {self.source or 'the source language'} to {self.target}. "
             "Preserve technical terms, numbers, math, and code blocks. "
             "Keep bullet-like brevity for short lines; keep paragraph flow for long text. "
-            "While faithfully retaining every keyword from the source (device names, terminology, etc.), craft the translation so it stays natural and slide-ready: concise, nominal in tone, and ending in nouns even if it requires light rephrasing. "
             "Adjust sentence structure so each translation reads as natural slide text in the target language, keeping it concise, polished, and ending in noun phrasing rather than a literal English rendering. "
             'For example, rephrase "Cooling requirements for the FTQC device can be met with commercially available cryoplants" as the noun phrase "Fulfillment of FTQC device cooling requirements via commercially available cryoplants". '
             "Leave English personal names exactly as written in English; do not translate or transliterate them. "
@@ -163,21 +162,32 @@ class ResponsesGPTTranslator(BaseTranslator):
                     data = getattr(content, "json", None)
                     if isinstance(data, dict):
                         translations = data.get("translations")
-                        if isinstance(translations, list):
-                            translations = [str(x) for x in translations]
-                            if len(translations) != len(texts):
-                                logger.warning(
-                                    "Responses API returned %s translations; expected %s. Adjusting result length.",
-                                    len(translations),
-                                    len(texts),
-                                )
-                                if len(translations) < len(texts):
-                                    translations = translations + [""] * (
-                                        len(texts) - len(translations)
-                                    )
-                                else:
-                                    translations = translations[: len(texts)]
-                            return translations
+                        if translations is None:
+                            logger.warning(
+                                "Responses API JSON payload missing `translations` field; retrying request. Payload: %s",
+                                str(data)[:400],
+                            )
+                            raise ValueError("Missing `translations` in response JSON")
+                        if not isinstance(translations, list):
+                            logger.warning(
+                                "Responses API returned `translations` of type %s; expected list. Retrying request. Payload: %s",
+                                type(translations).__name__,
+                                str(data)[:400],
+                            )
+                            raise ValueError(
+                                "Invalid `translations` type in response JSON"
+                            )
+                        if len(translations) != len(texts):
+                            logger.warning(
+                                "Responses API returned %s translations; expected %s. Retrying request. Payload: %s",
+                                len(translations),
+                                len(texts),
+                                str(data)[:400],
+                            )
+                            raise ValueError(
+                                "Mismatched translations count in response JSON"
+                            )
+                        return [str(x) for x in translations]
                 if ctype == "output_text":
                     text_val = getattr(content, "text", None)
                     if text_val:
@@ -188,55 +198,44 @@ class ResponsesGPTTranslator(BaseTranslator):
             if raw_text:
                 collected_text.append(raw_text)
 
-        translations: Optional[List[str]] = None
-        json_issue = False
-        fallback_text = ""
+        fallback_text = "\n".join(collected_text).strip()
+        errors: List[str] = []
         for chunk in collected_text:
             try:
                 data = json.loads(chunk)
-            except json.JSONDecodeError:
-                json_issue = True
+            except json.JSONDecodeError as exc:
+                errors.append(f"JSON decode error: {exc}")
                 continue
-            if isinstance(data, dict) and isinstance(data.get("translations"), list):
-                translations = [str(x) for x in data["translations"]]
-                json_issue = False
-                break
-            json_issue = True
-
-        if translations is None:
-            fallback_text = "\n".join(collected_text).strip()
-            if fallback_text:
-                try:
-                    parsed = json.loads(fallback_text)
-                except json.JSONDecodeError:
-                    json_issue = True
-                else:
-                    if isinstance(parsed, dict) and isinstance(
-                        parsed.get("translations"), list
-                    ):
-                        translations = [str(x) for x in parsed["translations"]]
-                        json_issue = False
-                    else:
-                        json_issue = True
-
-        if translations is None:
-            if json_issue:
+            if not isinstance(data, dict):
+                errors.append(f"Response JSON type {type(data).__name__}")
+                continue
+            translations = data.get("translations")
+            if translations is None:
+                errors.append("Missing `translations` field")
+                continue
+            if not isinstance(translations, list):
                 logger.warning(
-                    "Responses API returned data that is not valid translations JSON. "
-                    "Falling back to plain-text segmentation."
+                    "Responses API returned `translations` of type %s; expected list. Retrying request.",
+                    type(translations).__name__,
                 )
-            lines = [line for line in fallback_text.splitlines() if line.strip()]
-            return lines[: len(texts)] + [""] * (len(texts) - len(lines))
+                raise ValueError("Invalid `translations` type in response JSON")
+            if len(translations) != len(texts):
+                logger.warning(
+                    "Responses API returned %s translations; expected %s. Retrying request. Raw output: %s",
+                    len(translations),
+                    len(texts),
+                    chunk[:400],
+                )
+                raise ValueError("Mismatched translations count in response JSON")
+            return [str(x) for x in translations]
 
-        if len(translations) != len(texts):
+        if fallback_text:
             logger.warning(
-                "Responses API returned %s translations; expected %s. Adjusting result length.",
-                len(translations),
-                len(texts),
+                "Responses API returned non-conforming payload; retrying request. Reasons: %s. Raw output: %s",
+                "; ".join(errors) if errors else "unknown",
+                fallback_text[:400],
             )
-            if len(translations) < len(texts):
-                translations = translations + [""] * (len(texts) - len(translations))
-            else:
-                translations = translations[: len(texts)]
+        else:
+            logger.warning("Responses API returned empty payload; retrying request.")
 
-        return translations
+        raise ValueError("Responses API did not return valid translations JSON")
