@@ -128,14 +128,42 @@ def get_text(tf) -> str:
 
 
 def set_text(tf, new_text: str):
-    try:
-        # Clear runs if accessible (keeps paragraph structure minimal)
-        for p in list(tf.paragraphs):
-            for r in list(p.runs):
-                r.text = ""
-    except Exception:
-        pass
-    tf.text = new_text if new_text is not None else ""
+    # Preserve existing formatting by reusing current paragraphs and runs.
+    new_text = "" if new_text is None else new_text
+    paragraphs = list(tf.paragraphs)
+
+    # If there is no formatting to preserve, fall back to direct assignment.
+    if not paragraphs:
+        tf.text = new_text
+        return
+
+    parts = new_text.split("\n")
+
+    if len(parts) <= len(paragraphs):
+        assign_count = len(parts)
+    else:
+        assign_count = len(paragraphs)
+
+    for idx in range(assign_count):
+        text_piece = parts[idx]
+        if idx == assign_count - 1 and len(parts) > len(paragraphs):
+            overflow = parts[idx:]
+            text_piece = "\n".join(overflow)
+        para = paragraphs[idx]
+        if para.runs:
+            primary_run = para.runs[0]
+        else:
+            primary_run = para.add_run()
+        primary_run.text = text_piece
+        for extra in para.runs[1:]:
+            extra.text = ""
+
+    # Remove trailing paragraphs when translation has fewer segments.
+    for para in reversed(paragraphs[assign_count:]):
+        p = para._p
+        parent = p.getparent()
+        if parent is not None:
+            parent.remove(p)
 
 
 def collect_items(prs: Presentation, include_notes: bool, include_masters: bool):
@@ -405,9 +433,6 @@ def main():
 
                     print("  SRC:", repr(trunc(src)))
                     print("  DST:", repr(trunc(dst)))
-                    progress.update(1)
-                else:
-                    progress.update(1)
         else:
             # Re-apply into the actual text frames
             # We need to find the shape again; simplest approach: iterate again in the same order
@@ -416,6 +441,8 @@ def main():
         # Store final texts back into items array for later application
         for k, item in enumerate(group):
             items[item.idx] = TextItem(owner=item.owner, idx=item.idx, text=texts[k])
+
+        progress.update(len(group))
 
     progress.close()
 
