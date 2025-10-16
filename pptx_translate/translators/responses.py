@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 from typing import List, Optional
@@ -32,6 +33,34 @@ class ResponsesGPTTranslator(BaseTranslator):
         if not api_key:
             raise RuntimeError("Set OPENAI_API_KEY environment variable.")
         self.client = OpenAI(api_key=api_key)
+        self._response_format_mode = self._detect_response_format_support()
+        if self._response_format_mode is None:
+            version = getattr(OpenAI, "__version__", None)
+            if version is None:
+                try:
+                    import openai  # type: ignore
+
+                    version = getattr(openai, "__version__", None)
+                except Exception:
+                    version = None
+            raise RuntimeError(
+                "The installed `openai` package does not expose structured output parameters for the Responses API. "
+                "Install a release that supports either the `response_format` or `text.format` JSON schema configuration "
+                "(for example `pip install \"openai>=1.48,<2.0\"`)."
+                + (f" Detected version: {version}." if version else "")
+            )
+
+    def _detect_response_format_support(self) -> Optional[str]:
+        try:
+            signature = inspect.signature(self.client.responses.create)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        params = signature.parameters
+        if "response_format" in params:
+            return "response_format"
+        if "text" in params:
+            return "text"
+        return None
 
     @retry(
         reraise=True,
@@ -59,6 +88,18 @@ class ResponsesGPTTranslator(BaseTranslator):
         if context:
             sys += f" Use this context for disambiguation: {context[:4000]}"
 
+        schema_body = {
+            "type": "object",
+            "properties": {
+                "translations": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                }
+            },
+            "required": ["translations"],
+            "additionalProperties": False,
+        }
+
         request_args = {
             "model": self.model,
             "input": [
@@ -71,24 +112,27 @@ class ResponsesGPTTranslator(BaseTranslator):
                     "content": [{"type": "input_text", "text": joined}],
                 },
             ],
-            "response_format": {
+        }
+
+        if self._response_format_mode == "response_format":
+            request_args["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "translation_response",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "translations": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            }
-                        },
-                        "required": ["translations"],
-                        "additionalProperties": False,
-                    },
+                    "schema": schema_body,
                 },
-            },
-        }
+            }
+        elif self._response_format_mode == "text":
+            request_args["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "translation_response",
+                    "schema": schema_body,
+                }
+            }
+        else:
+            raise RuntimeError("Structured output not supported by the current OpenAI client.")
+
         if self.temperature is not None:
             request_args["temperature"] = self.temperature
 
