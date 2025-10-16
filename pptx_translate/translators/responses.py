@@ -1,8 +1,8 @@
 import inspect
 import json
+import logging
 import os
 from typing import List, Optional
-
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -16,6 +16,8 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
+
+logger = logging.getLogger(__name__)
 
 
 class ResponsesGPTTranslator(BaseTranslator):
@@ -72,8 +74,7 @@ class ResponsesGPTTranslator(BaseTranslator):
         if not texts:
             return []
 
-        delimiter = "\n\n<<<SPLIT>>>\n\n"
-        joined = delimiter.join(texts)
+        payload = json.dumps({"segments": texts})
 
         sys = (
             "You are a professional translator. "
@@ -81,6 +82,7 @@ class ResponsesGPTTranslator(BaseTranslator):
             "Preserve technical terms, numbers, math, and code blocks. "
             "Keep bullet-like brevity for short lines; keep paragraph flow for long text. "
             "While faithfully retaining every keyword from the source (device names, terminology, etc.), craft the translation so it stays natural and slide-ready: concise and preferably ending in nouns. "
+            "Leave English personal names exactly as written in English; do not translate or transliterate them. "
             "If a line is a source attribution, copy it verbatim without translating. "
             "Return the final answer strictly as JSON with a single field `translations`, which is an array of strings whose length matches the number of provided segments."
         )
@@ -109,7 +111,17 @@ class ResponsesGPTTranslator(BaseTranslator):
                 },
                 {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": joined}],
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Translate each entry in the `segments` array contained in the "
+                                "following JSON payload. Return only the JSON response requested "
+                                "in the system instructions."
+                            ),
+                        },
+                        {"type": "input_text", "text": payload},
+                    ],
                 },
             ],
         }
@@ -150,6 +162,11 @@ class ResponsesGPTTranslator(BaseTranslator):
                         if isinstance(translations, list):
                             translations = [str(x) for x in translations]
                             if len(translations) != len(texts):
+                                logger.warning(
+                                    "Responses API returned %s translations; expected %s. Adjusting result length.",
+                                    len(translations),
+                                    len(texts),
+                                )
                                 if len(translations) < len(texts):
                                     translations = translations + [""] * (
                                         len(texts) - len(translations)
@@ -168,25 +185,51 @@ class ResponsesGPTTranslator(BaseTranslator):
                 collected_text.append(raw_text)
 
         translations: Optional[List[str]] = None
+        json_issue = False
+        fallback_text = ""
         for chunk in collected_text:
             try:
                 data = json.loads(chunk)
             except json.JSONDecodeError:
+                json_issue = True
                 continue
             if isinstance(data, dict) and isinstance(data.get("translations"), list):
                 translations = [str(x) for x in data["translations"]]
+                json_issue = False
                 break
+            json_issue = True
 
         if translations is None:
-            # Fall back to delimiter-based parsing
-            fallback_text = "\n".join(collected_text)
-            parts = fallback_text.split(delimiter)
-            if len(parts) != len(texts):
-                lines = fallback_text.splitlines()
-                return lines[: len(texts)] + [""] * (len(texts) - len(lines))
-            return parts
+            fallback_text = "\n".join(collected_text).strip()
+            if fallback_text:
+                try:
+                    parsed = json.loads(fallback_text)
+                except json.JSONDecodeError:
+                    json_issue = True
+                else:
+                    if isinstance(parsed, dict) and isinstance(
+                        parsed.get("translations"), list
+                    ):
+                        translations = [str(x) for x in parsed["translations"]]
+                        json_issue = False
+                    else:
+                        json_issue = True
+
+        if translations is None:
+            if json_issue:
+                logger.warning(
+                    "Responses API returned data that is not valid translations JSON. "
+                    "Falling back to plain-text segmentation."
+                )
+            lines = [line for line in fallback_text.splitlines() if line.strip()]
+            return lines[: len(texts)] + [""] * (len(texts) - len(lines))
 
         if len(translations) != len(texts):
+            logger.warning(
+                "Responses API returned %s translations; expected %s. Adjusting result length.",
+                len(translations),
+                len(texts),
+            )
             if len(translations) < len(texts):
                 translations = translations + [""] * (len(texts) - len(translations))
             else:

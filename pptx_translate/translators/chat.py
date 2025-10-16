@@ -51,6 +51,7 @@ class ChatGPTTranslator(BaseTranslator):
             "Preserve technical terms, numbers, math, and code blocks. "
             "Keep bullet-like brevity for short lines; keep paragraph flow for long text. "
             "While faithfully retaining every keyword from the source (device names, terminology, etc.), craft the translation so it stays natural and slide-ready: concise and preferably ending in nouns. "
+            "Leave English personal names exactly as written in English; do not translate or transliterate them. "
             "If a line is a source attribution, copy it verbatim without translating. "
             "Do NOT add extra commentary. Return only the translations joined by the same delimiter."
         )
