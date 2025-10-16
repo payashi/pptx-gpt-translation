@@ -1,0 +1,4 @@
+.venv
+*.pptx
+.env*
+!.env.example
