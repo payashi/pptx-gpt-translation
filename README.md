@@ -45,6 +45,9 @@ Key flags:
 - Some chart elements may not expose text frames via python-pptx.
 - Keep an eye on **token usage**; this tool avoids sending the entire deck every time to reduce cost/latency.
 
+## Troubleshooting
+- `<<<SPLIT>>>` showing up in slides usually means the Chat Completions API inserted extra whitespace around the internal delimiter, so the parser couldn't align translations with the source segments. Run with `--api responses` (JSON output) or adjust `pptx_translate/translators/chat.py` to split more defensively if you must stay on `--api chat`.
+
 ## Cost tip
 If cost matters, try `--model gpt-4o-mini` first. For best nuance/tone, try `gpt-4o`.
 
